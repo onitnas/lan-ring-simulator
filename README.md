@@ -15,96 +15,53 @@ Host 5 (5005) <- Host 4 (5004) <-------+
 Host 1..5 -- UDP --> Logger (6000)
 ```
 
-- **`host.c`**: un unico processo con cinque host logici, ciascuno con un thread ricevente TCP e un thread elaboratore (dieci thread in totale).
-- **`logger.c`**: processo indipendente con server UDP in ascolto sulla porta 6000.
-- Tutti i socket sono associati a **127.0.0.1**: la topologia è simulata sulla stessa macchina, ma la comunicazione utilizza veri socket.
-
-## Buffer condiviso e mutua esclusione
-
-Ogni host possiede un **buffer a uno slot**, condiviso tra i suoi due thread:
-
-1. Il thread **ricevente** accetta una connessione TCP e inserisce il messaggio nel buffer.
-2. Il thread **elaboratore** preleva il messaggio e controlla l'ID del destinatario.
-3. Se il destinatario coincide con l'host corrente, il messaggio viene consegnato e registrato sul logger.
-4. Se il messaggio ritorna all'host mittente, viene scartato.
-5. Altrimenti viene inoltrato tramite TCP all'host successivo.
-
-Il `pthread_mutex_t` protegge l'accesso concorrente al buffer. Le due variabili di condizione `non_pieno` e `non_vuoto` fanno attendere i thread rispettivamente quando il buffer è occupato o vuoto. `pthread_cond_wait()` rilascia temporaneamente il mutex mentre il thread attende e lo riacquisisce al risveglio. Un ulteriore mutex sincronizza alcune stampe sulla console del processo host.
-
-**Nota:** non esiste un buffer unico per tutta la rete: ogni host ha il proprio buffer condiviso tra due thread. Possono essere in transito più messaggi contemporaneamente; i mutex non rendono l'intero anello a messaggio singolo.
-
-## Formato del messaggio
-
-Ogni messaggio contiene:
-
-| Campo | Significato |
-| --- | --- |
-| `mittente` | ID dell'host che ha originato il messaggio |
-| `destinatario` | ID dell'host destinatario |
-| `testo` | Contenuto testuale (massimo 255 caratteri più terminatore) |
-
-I campi numerici vengono codificati per la trasmissione TCP; l'invio e la ricezione gestiscono anche trasferimenti parziali.
-
-## Requisiti
-
-- Linux o ambiente POSIX compatibile
-- Compilatore C (es. GCC)
-- Libreria pthread e socket POSIX
-
 ## Compilazione
 
 ```bash
-gcc  -pthread host.c -o host
+gcc -pthread host.c -o host
 gcc logger.c -o logger
 ```
 
-## Esecuzione
+## Avvio
 
-Aprire **due terminali**. Avviare prima il logger:
-
-```bash
-./logger
-```
-
-Nel secondo terminale:
+In sei terminali distinti:
 
 ```bash
-./host
+./logger 6000
+./host 1 6000
+./host 2 6000
+./host 3 6000
+./host 4 6000
+./host 5 6000
 ```
 
-Il programma chiede mittente, destinatario e testo. Inserire `0` come mittente per terminare il processo host.
+Il logger richiede la porta di ascolto. Senza argomenti stampa `Usage: ./logger <porta>` e termina. Ogni host richiede il proprio ID (1-5) e la porta UDP del logger. Le porte TCP sono 5001-5005 e l'anello segue l'ordine 1→2→3→4→5→1.
 
-### Esempio: consegna corretta
-
-Input nel terminale degli host:
+In un terminale host digitare, per esempio:
 
 ```text
-Mittente (1-5, 0 per uscire): 1
-Destinatario: 4
-Testo: Ciao host 4
+4 Ciao host 4!
 ```
 
-Il messaggio segue il percorso **1 → 2 → 3 → 4**. Output atteso nel terminale del logger:
+Il logger stampa:
 
 ```text
-[LOGGER][host-1]Invia messaggio: Ciao host 4
-[LOGGER][host-4]Riceve messaggio: Ciao host 4
+[LOGGER][host-1]Invia messaggio: Ciao host 4!
+[LOGGER][host-4]Riceve messaggio: Ciao host 4!
 ```
 
-### Esempio: destinatario inesistente
+Un destinatario inesistente (es. `9`) fa percorrere al messaggio tutto l'anello; quando torna al mittente, viene scartato.
 
-```text
-Mittente (1-5, 0 per uscire): 2
-Destinatario: 9
-Testo: Messaggio di prova
-```
+## Thread, buffer e mutex
 
-Il messaggio compie il percorso **2 → 3 → 4 → 5 → 1 → 2** e viene scartato. Il logger registra l'invio; lo scarto viene stampato nel terminale degli host.
+Ogni processo host contiene un thread ricevente TCP e un thread elaboratore. I due thread condividono un buffer di **un messaggio**. Il ricevente inserisce un messaggio nel buffer; l'elaboratore lo preleva e decide se consegnarlo, scartarlo o inoltrarlo. Un mutex protegge il buffer e due variabili di condizione permettono di attendere quando è pieno o vuoto senza consumare CPU inutilmente.
 
-## Scelte progettuali e limiti
+I mutex sono **locali a ciascun processo**: non esiste un mutex globale condiviso tra tutti i cinque host. Possono circolare più messaggi contemporaneamente.
 
-- TCP trasporta i messaggi tra host consecutivi; UDP trasporta i log senza garanzia di consegna.
-- La simulazione è locale e non implementa cinque processi host indipendenti.
-- Il buffer a uno slot introduce attesa quando è occupato, evitando sovrascritture.
-- La chiusura del processo host non esegue un arresto ordinato dei thread.
-- Non sono previsti ritrasmissione applicativa, persistenza dei messaggi o autenticazione.
+## Note
+
+- I processi devono essere avviati tutti prima di iniziare gli invii; altrimenti una connessione TCP può fallire.
+- La comunicazione usa `127.0.0.1`: i sei processi sono indipendenti ma girano sulla stessa macchina.
+- TCP è uno stream di byte: il codice gestisce letture e scritture parziali e serializza i campi numerici in network byte order.
+- UDP non garantisce la consegna degli eventi al logger.
+- Questa è una simulazione didattica: non implementa ritrasmissioni applicative, arresto coordinato o autenticazione dei messaggi.
