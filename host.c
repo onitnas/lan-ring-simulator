@@ -1,116 +1,120 @@
-#include <arpa/inet.h>
-#include <errno.h>
-#include <pthread.h>
-#include <stdint.h>
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-#include <unistd.h>
 
-#define HOSTS 5
+#define N_HOST 5
 #define BASE_PORT 5001
-#define LOGGER_PORT 6000
-#define TEXT_SIZE 256
-#define WIRE_SIZE (3 * sizeof(uint32_t) + TEXT_SIZE)
+#define MAX_TEXT 256
+#define WIRE_SIZE (12 + MAX_TEXT)
 
 typedef struct {
-    int mittente;
-    int destinatario;
-    char testo[TEXT_SIZE];
+    int mittente, destinatario;
+    uint32_t id_messaggio;
+    char testo[MAX_TEXT];
 } Messaggio;
 
 typedef struct {
     Messaggio msg;
     int pieno;
     pthread_mutex_t mutex;
-    pthread_cond_t non_pieno;
-    pthread_cond_t non_vuoto;
+    pthread_cond_t non_pieno, non_vuoto;
 } Buffer;
 
 typedef struct {
-    int id;
-    int server;
+    int id, porta_logger;
     Buffer buffer;
-    pthread_t ricevente;
-    pthread_t elaboratore;
 } Host;
 
-static Host hosts[HOSTS];
-static pthread_mutex_t console_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t mutex_console = PTHREAD_MUTEX_INITIALIZER;
 
-static int invia_tutto(int fd, const void *data, size_t size) {
-    const char *p = data;
-    while (size > 0) {
-        ssize_t n = send(fd, p, size, MSG_NOSIGNAL);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            return -1;
-        p += n;
-        size -= (size_t)n;
+static int send_all(int fd, const void *buf, size_t len) {
+    const unsigned char *p = buf;
+    while (len) {
+        ssize_t n = send(fd, p, len, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        p += n; len -= (size_t)n;
     }
     return 0;
 }
 
-static int ricevi_tutto(int fd, void *data, size_t size) {
-    char *p = data;
-    while (size > 0) {
-        ssize_t n = recv(fd, p, size, 0);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            return -1;
-        p += n;
-        size -= (size_t)n;
+static int recv_all(int fd, void *buf, size_t len) {
+    unsigned char *p = buf;
+    while (len) {
+        ssize_t n = recv(fd, p, len, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        p += n; len -= (size_t)n;
     }
     return 0;
 }
 
-/* Protocollo TCP: 3 campi a 32 bit in network order + testo fisso. */
-static void codifica(const Messaggio *m, unsigned char out[WIRE_SIZE]) {
-    uint32_t header[3] = {htonl((uint32_t)m->mittente),
-                          htonl((uint32_t)m->destinatario), htonl(TEXT_SIZE)};
-    memcpy(out, header, sizeof(header));
-    memcpy(out + sizeof(header), m->testo, TEXT_SIZE);
+static void serializza(const Messaggio *m, unsigned char wire[WIRE_SIZE]) {
+    uint32_t fields[3] = {
+        htonl((uint32_t)m->mittente), htonl((uint32_t)m->destinatario),
+        htonl(m->id_messaggio)
+    };
+    memcpy(wire, fields, sizeof(fields));
+    memcpy(wire + 12, m->testo, MAX_TEXT);
 }
 
-static int decodifica(const unsigned char in[WIRE_SIZE], Messaggio *m) {
-    uint32_t header[3];
-    memcpy(header, in, sizeof(header));
-    if (ntohl(header[2]) != TEXT_SIZE)
-        return -1;
-    m->mittente = (int)ntohl(header[0]);
-    m->destinatario = (int)ntohl(header[1]);
-    memcpy(m->testo, in + sizeof(header), TEXT_SIZE);
-    m->testo[TEXT_SIZE - 1] = '\0';
-    return m->mittente >= 1 && m->mittente <= HOSTS ? 0 : -1;
+static void deserializza(const unsigned char wire[WIRE_SIZE], Messaggio *m) {
+    uint32_t fields[3];
+    memcpy(fields, wire, sizeof(fields));
+    m->mittente = (int)ntohl(fields[0]);
+    m->destinatario = (int)ntohl(fields[1]);
+    m->id_messaggio = ntohl(fields[2]);
+    memcpy(m->testo, wire + 12, MAX_TEXT);
+    m->testo[MAX_TEXT-1] = '\0';
 }
 
-static void invia_log(int id, const char *azione, const char *testo) {
+static void invia_log(const Host *h, const char *azione, const char *testo) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        perror("socket UDP");
-        return;
-    }
+    if (fd < 0) { perror("socket UDP"); return; }
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(LOGGER_PORT);
+    addr.sin_port = htons((unsigned short)h->porta_logger);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    char line[512];
-    snprintf(line, sizeof(line), "[LOGGER][host-%d]%s messaggio: %s", id,
-             azione, testo);
-    if (sendto(fd, line, strlen(line), 0, (struct sockaddr *)&addr,
-               sizeof(addr)) < 0)
-        perror("sendto logger");
+    char linea[512];
+    snprintf(linea, sizeof(linea), "[LOGGER][host-%d]%s messaggio: %s",
+             h->id, azione, testo);
+    if (sendto(fd, linea, strlen(linea), 0, (struct sockaddr *)&addr,
+               sizeof(addr)) < 0) perror("sendto");
     close(fd);
+}
+
+static int invia_tcp(int id, const Messaggio *m) {
+    int successivo = id % N_HOST + 1;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { perror("socket TCP"); return -1; }
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(BASE_PORT + successivo - 1);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "Host %d: impossibile contattare host %d: %s\n",
+                id, successivo, strerror(errno));
+        close(fd); return -1;
+    }
+    unsigned char wire[WIRE_SIZE];
+    serializza(m, wire);
+    int rc = send_all(fd, wire, sizeof(wire));
+    if (rc < 0) perror("send TCP");
+    close(fd);
+    return rc;
 }
 
 static void inserisci(Buffer *b, const Messaggio *m) {
     pthread_mutex_lock(&b->mutex);
-    while (b->pieno)
-        pthread_cond_wait(&b->non_pieno, &b->mutex);
+    while (b->pieno) pthread_cond_wait(&b->non_pieno, &b->mutex);
     b->msg = *m;
     b->pieno = 1;
     pthread_cond_signal(&b->non_vuoto);
@@ -119,8 +123,7 @@ static void inserisci(Buffer *b, const Messaggio *m) {
 
 static Messaggio preleva(Buffer *b) {
     pthread_mutex_lock(&b->mutex);
-    while (!b->pieno)
-        pthread_cond_wait(&b->non_vuoto, &b->mutex);
+    while (!b->pieno) pthread_cond_wait(&b->non_vuoto, &b->mutex);
     Messaggio m = b->msg;
     b->pieno = 0;
     pthread_cond_signal(&b->non_pieno);
@@ -128,45 +131,28 @@ static Messaggio preleva(Buffer *b) {
     return m;
 }
 
-static int invia_tcp(int id, const Messaggio *m) {
-    int successivo = id % HOSTS + 1;
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        perror("socket TCP");
-        return -1;
-    }
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(BASE_PORT + successivo - 1);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("connect TCP");
-        close(fd);
-        return -1;
-    }
-    unsigned char wire[WIRE_SIZE];
-    codifica(m, wire);
-    int rc = invia_tutto(fd, wire, sizeof(wire));
-    if (rc != 0)
-        perror("send TCP");
-    close(fd);
-    return rc;
-}
-
 static void *ricevente(void *arg) {
     Host *h = arg;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { perror("socket server"); exit(EXIT_FAILURE); }
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(BASE_PORT + h->id - 1);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(fd, 16) < 0) {
+        perror("bind/listen"); exit(EXIT_FAILURE);
+    }
     for (;;) {
-        int client = accept(h->server, NULL, NULL);
-        if (client < 0) {
-            if (errno != EINTR)
-                perror("accept");
-            continue;
-        }
+        int client = accept(fd, NULL, NULL);
+        if (client < 0) { if (errno != EINTR) perror("accept"); continue; }
         unsigned char wire[WIRE_SIZE];
-        Messaggio m;
-        if (ricevi_tutto(client, wire, sizeof(wire)) == 0 &&
-            decodifica(wire, &m) == 0) {
-            inserisci(&h->buffer, &m);
+        if (recv_all(client, wire, sizeof(wire)) == 0) {
+            Messaggio m;
+            deserializza(wire, &m);
+            if (m.mittente >= 1 && m.mittente <= N_HOST)
+                inserisci(&h->buffer, &m);
         }
         close(client);
     }
@@ -178,13 +164,17 @@ static void *elaboratore(void *arg) {
     for (;;) {
         Messaggio m = preleva(&h->buffer);
         if (m.destinatario == h->id) {
-            invia_log(h->id, "Riceve", m.testo);
-        } else if (m.mittente == h->id) {
-            pthread_mutex_lock(&console_mutex);
-            printf("\n[host-%d] Scartato: destinatario %d inesistente (%s)\n",
-                   h->id, m.destinatario, m.testo);
+            invia_log(h, "Riceve", m.testo);
+            pthread_mutex_lock(&mutex_console);
+            printf("\n[host-%d] Ricevuto da host-%d: %s\n", h->id, m.mittente, m.testo);
             fflush(stdout);
-            pthread_mutex_unlock(&console_mutex);
+            pthread_mutex_unlock(&mutex_console);
+        } else if (m.mittente == h->id) {
+            pthread_mutex_lock(&mutex_console);
+            printf("\n[host-%d] Messaggio scartato: destinatario %d non trovato\n",
+                   h->id, m.destinatario);
+            fflush(stdout);
+            pthread_mutex_unlock(&mutex_console);
         } else {
             invia_tcp(h->id, &m);
         }
@@ -192,84 +182,65 @@ static void *elaboratore(void *arg) {
     return NULL;
 }
 
-static int crea_server(int id) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0)
-        return -1;
-    int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(BASE_PORT + id - 1);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
-        listen(fd, 16) < 0) {
-        perror("bind/listen");
-        close(fd);
-        return -1;
-    }
-    return fd;
+static int porta_valida(const char *s) {
+    char *end;
+    errno = 0;
+    long n = strtol(s, &end, 10);
+    if (errno || !*s || *end || n < 1 || n > 65535) return -1;
+    return (int)n;
 }
 
-int main(void) {
-    /* Apriamo tutti i server prima di avviare i thread: niente sleep(1). */
-    for (int i = 0; i < HOSTS; ++i) {
-        hosts[i].id = i + 1;
-        hosts[i].server = crea_server(i + 1);
-        if (hosts[i].server < 0)
-            return EXIT_FAILURE;
-        Buffer *b = &hosts[i].buffer;
-        pthread_mutex_init(&b->mutex, NULL);
-        pthread_cond_init(&b->non_pieno, NULL);
-        pthread_cond_init(&b->non_vuoto, NULL);
+int main(int argc, char **argv) {
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <id_host:1-5> <porta_logger>\n", argv[0]);
+        return 1;
     }
-    for (int i = 0; i < HOSTS; ++i) {
-        if (pthread_create(&hosts[i].ricevente, NULL, ricevente, &hosts[i]) !=
-                0 ||
-            pthread_create(&hosts[i].elaboratore, NULL, elaboratore,
-                           &hosts[i]) != 0) {
-            fprintf(stderr, "Errore creazione thread\n");
-            return EXIT_FAILURE;
+    int id = porta_valida(argv[1]);
+    int porta = porta_valida(argv[2]);
+    if (id < 1 || id > N_HOST || porta < 0) {
+        fprintf(stderr, "Usage: %s <id_host:1-5> <porta_logger>\n", argv[0]);
+        return 1;
+    }
+    Host h = { .id = id, .porta_logger = porta };
+    pthread_mutex_init(&h.buffer.mutex, NULL);
+    pthread_cond_init(&h.buffer.non_pieno, NULL);
+    pthread_cond_init(&h.buffer.non_vuoto, NULL);
+    pthread_t t_rx, t_work;
+    if (pthread_create(&t_rx, NULL, ricevente, &h) ||
+        pthread_create(&t_work, NULL, elaboratore, &h)) {
+        fprintf(stderr, "Errore creazione thread\n"); return 1;
+    }
+    printf("Host %d avviato su TCP %d (successivo: %d, logger UDP: %d)\n",
+           id, BASE_PORT + id - 1, id % N_HOST + 1, porta);
+    printf("Invio: <destinatario> <testo>  |  exit per uscire\n");
+    char line[512];
+    uint32_t seq = 0;
+    while (fgets(line, sizeof(line), stdin)) {
+        if (!strcmp(line, "exit\n") || !strcmp(line, "exit")) break;
+        char *p = line;
+        errno = 0;
+        char *end;
+        long dest = strtol(p, &end, 10);
+        if (errno || end == p || (*end != ' ' && *end != '\t')) {
+            puts("Formato: <destinatario> <testo>"); continue;
         }
-    }
-    puts("Anello TCP pronto: 5 host (porte 5001-5005). Logger UDP: 6000.");
-    char line[64];
-    for (;;) {
-        int mittente, destinatario;
+        while (*end == ' ' || *end == '\t') end++;
+        end[strcspn(end, "\n")] = '\0';
+        if (!*end || dest < 1 || dest > 65535) {
+            puts("Destinatario/testo non valido"); continue;
+        }
         Messaggio m = {0};
-        printf("\nMittente (1-5, 0 per uscire): ");
-        fflush(stdout);
-        if (!fgets(line, sizeof(line), stdin) ||
-            sscanf(line, "%d", &mittente) != 1)
-            break;
-        if (mittente == 0)
-            break;
-        if (mittente < 1 || mittente > HOSTS) {
-            puts("Mittente non valido");
+        m.mittente = id;
+        m.destinatario = (int)dest;
+        m.id_messaggio = ++seq;
+        snprintf(m.testo, sizeof(m.testo), "%s", end);
+        if (dest == id) {
+            invia_log(&h, "Invia", m.testo);
+            invia_log(&h, "Riceve", m.testo);
             continue;
         }
-        printf("Destinatario: ");
-        fflush(stdout);
-        if (!fgets(line, sizeof(line), stdin) ||
-            sscanf(line, "%d", &destinatario) != 1)
-            break;
-        printf("Testo: ");
-        fflush(stdout);
-        if (!fgets(m.testo, sizeof(m.testo), stdin))
-            break;
-        m.testo[strcspn(m.testo, "\n")] = '\0';
-        m.mittente = mittente;
-        m.destinatario = destinatario;
-        if (destinatario == mittente) {
-            /* Un messaggio a se stessi e' consegnato localmente. */
-            invia_log(mittente, "Invia", m.testo);
-            invia_log(mittente, "Riceve", m.testo);
-        } else {
-            invia_log(mittente, "Invia", m.testo);
-            if (invia_tcp(mittente, &m) != 0)
-                fprintf(stderr, "Invio non riuscito\n");
-        }
+        if (invia_tcp(id, &m) == 0) invia_log(&h, "Invia", m.testo);
     }
-    /* Il processo termina; il sistema operativo chiude i socket e i thread. */
+    puts("Chiusura del processo host.");
     return 0;
 }
